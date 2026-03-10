@@ -1270,6 +1270,12 @@ const Database = {
             throw e;
           }
         }
+        // [新增] 动态追加 error_detail 字段用于存储 4xx/5xx 报错明细
+        try {
+          await db.prepare(`ALTER TABLE proxy_logs ADD COLUMN error_detail TEXT`).run();
+        } catch (e) {
+          // 忽略已存在的报错
+        }
         await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_timestamp ON proxy_logs (timestamp)`).run();
         await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_client_ip ON proxy_logs (client_ip)`).run();
         await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_node_time ON proxy_logs (node_name, timestamp)`).run();
@@ -1326,7 +1332,26 @@ const Proxy = {
     }
 
     const rangeHeader = request.headers.get("Range");
-    const isHeadPrewarm = request.method === "GET" && !!rangeHeader && /^bytes=0-1\d{5,6}$/.test(rangeHeader);
+
+    // [预热修复] 1. 提取全局开关和自定义 TTL 配置
+    const enablePrewarm = currentConfig.enablePrewarm !== false; // 默认开启
+    const prewarmCacheTtl = parseInt(currentConfig.prewarmCacheTtl) || 180;
+
+    // [预热进阶] 命中预热探测时，旁路预取后续一段数据（用于温后续 Range/分段）
+    // 默认 4MB，可在面板配置 prewarmPrefetchBytes；设置为 0 可关闭
+    const prewarmPrefetchBytes = Math.max(
+      0,
+      parseInt(currentConfig.prewarmPrefetchBytes) || (4 * 1024 * 1024)
+    );
+
+    // [预热修复] 2. 结合开关，放宽 Range 识别（兼容 bytes=0- / bytes=0-0 / bytes=0-1 / bytes=0-xxxxx），并兼容 HEAD 请求
+    // 说明：保持 0~7 位数字上限，避免把超大 Range 也误判为预热
+    const isHeadPrewarm =
+      enablePrewarm &&
+      (request.method === "GET" || request.method === "HEAD") &&
+      !!rangeHeader &&
+      /^bytes=0-(\d{0,7})?$/.test(rangeHeader);
+
     const isImage = GLOBALS.Regex.EmbyImages.test(proxyPath) || GLOBALS.Regex.StaticExt.test(proxyPath);
     const isSubtitle = GLOBALS.Regex.SubtitleExt.test(proxyPath);
     const isManifest = GLOBALS.Regex.ManifestExt.test(proxyPath);
@@ -1485,7 +1510,13 @@ const Proxy = {
         headers.delete("Content-Length");
       }
 
-      const fetchOptions = { method: effectiveMethod, headers, redirect: "manual", cf: { cacheEverything: false, cacheTtl: 0 } };
+      // [预热修复] 3. 当命中预热探测时，真正命令 Cloudflare 边缘节点进行缓存
+      const fetchOptions = { 
+        method: effectiveMethod, 
+        headers, 
+        redirect: "manual", 
+        cf: isHeadPrewarm ? { cacheEverything: true, cacheTtl: prewarmCacheTtl } : { cacheEverything: false, cacheTtl: 0 } 
+      };
       if (effectiveMethod !== "GET" && effectiveMethod !== "HEAD") {
         if (effectiveBodyMode === "buffered" && effectiveBody !== null && effectiveBody !== undefined) fetchOptions.body = effectiveBody.slice(0);
         else if (effectiveBodyMode === "stream") fetchOptions.body = effectiveBody;
@@ -1651,8 +1682,8 @@ const Proxy = {
       if (isImage || isSubtitle || isManifest) {
         modifiedHeaders.set("Cache-Control", "public, max-age=86400");
       } else if (isHeadPrewarm) {
-        // 对于播放器频繁的 HEAD 预热请求，给个 3 分钟的微型缓存，防止击穿源站
-        modifiedHeaders.set("Cache-Control", "public, max-age=180");
+        // [预热修复] 4. 使用面板自定义的缓存时长下发给播放器
+        modifiedHeaders.set("Cache-Control", `public, max-age=${prewarmCacheTtl}`);
       } else if (isBigStream || proxiedExternalRedirect) {
         modifiedHeaders.set("Cache-Control", "no-store");
       }
@@ -1689,6 +1720,22 @@ const Proxy = {
       else if (isSubtitle) reqCategory = "subtitle";
       else if (isWsUpgrade) reqCategory = "websocket";
 
+      // [新增] 智能提取 4xx/5xx 的异常请求头
+      let errorDetail = null;
+      if (response.status >= 400) {
+          const hints = [];
+          const srv = response.headers.get("Server");
+          if (srv) hints.push(`Server: ${srv}`);
+          const ray = response.headers.get("CF-Ray");
+          if (ray) hints.push(`CF-Ray: ${ray}`);
+          const embyErr = response.headers.get("X-Application-Error-Code") || response.headers.get("X-Emby-Error");
+          if (embyErr) hints.push(`Emby-Error: ${embyErr}`);
+          const cfCache = response.headers.get("CF-Cache-Status");
+          if (cfCache) hints.push(`CF-Cache: ${cfCache}`);
+          
+          errorDetail = hints.length > 0 ? hints.join(" | ") : response.statusText;
+      }
+
       Logger.record(env, ctx, {
         nodeName: name,
         requestPath: proxyPath,
@@ -1698,8 +1745,59 @@ const Proxy = {
         clientIp,
         userAgent: request.headers.get("User-Agent"),
         referer: request.headers.get("Referer"),
-        category: reqCategory
+        category: reqCategory,
+        errorDetail: errorDetail // [新增]
       });
+
+
+      // [预热进阶] 命中预热探测时，旁路预取后续一段 Range（只对视频路由生效），用于温后续分段/Range
+      // - 依赖 ctx.waitUntil，不影响主请求返回
+      // - 仅在源站支持 Range（206 或 Content-Range）时执行，避免误触发全量下载
+      // - 使用 X-Prewarm-Prefetch=1 防止递归/回环
+      if (
+        isHeadPrewarm &&
+        looksLikeVideoRoute &&
+        !isManifest &&
+        !isSegment &&
+        prewarmPrefetchBytes > 0 &&
+        ctx &&
+        request.headers.get("X-Prewarm-Prefetch") !== "1"
+      ) {
+        const contentRange = response.headers.get("Content-Range");
+        const isPartial = response.status === 206 || !!contentRange;
+        if (isPartial) {
+          ctx.waitUntil(
+            (async () => {
+              try {
+                // 解析原始探测 Range：bytes=0- / bytes=0-0 / bytes=0-1 / bytes=0-xxxxx
+                const m = /^bytes=0-(\d{0,7})?$/.exec(rangeHeader || "");
+                let nextStart = 0;
+                if (m && m[1] && m[1].length > 0) {
+                  const endNum = parseInt(m[1], 10);
+                  if (!Number.isNaN(endNum)) nextStart = endNum + 1;
+                }
+
+                const prefetchStart = nextStart;
+                const prefetchEnd = prefetchStart + prewarmPrefetchBytes - 1;
+                if (prefetchEnd < prefetchStart) return;
+
+                const prefetchRange = `bytes=${prefetchStart}-${prefetchEnd}`;
+                const prefetchOptions = await buildFetchOptions(finalUrl, { method: "GET" });
+                prefetchOptions.headers.set("Range", prefetchRange);
+                // 去掉可能影响缓存/命中的条件请求头
+                prefetchOptions.headers.delete("If-Modified-Since");
+                prefetchOptions.headers.delete("If-None-Match");
+                prefetchOptions.headers.set("X-Prewarm-Prefetch", "1");
+
+                const prefetchRes = await fetch(finalUrl.toString(), prefetchOptions);
+                try {
+                  prefetchRes.body?.cancel?.();
+                } catch {}
+              } catch {}
+            })()
+          );
+        }
+      }
 
       const finalStatus = directRedirectStatus || response.status;
       const finalStatusText = directRedirectStatus ? "Temporary Redirect" : response.statusText;
@@ -1717,7 +1815,8 @@ const Proxy = {
         statusCode: 502,
         responseTime: Date.now() - startTime,
         clientIp,
-        category: "error"
+        category: "error",
+        errorDetail: err.message || "网关或 CF Workers 内部崩溃" // [新增]
       });
 
       const errHeaders = new Headers({
@@ -1772,6 +1871,7 @@ const Logger = {
       userAgent: logData.userAgent || null,
       referer: logData.referer || null,
       category: logData.category || "api",
+      errorDetail: logData.errorDetail || null, // [新增] 记录错误详情
       createdAt: new Date().toISOString()
     });
 
@@ -1792,7 +1892,7 @@ const Logger = {
     if (!db || GLOBALS.LogQueue.length === 0) return;
     const batchLogs = GLOBALS.LogQueue.splice(0, GLOBALS.LogQueue.length);
     try {
-      const statements = batchLogs.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.createdAt));
+      const statements = batchLogs.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, error_detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.errorDetail, item.createdAt));
       await db.batch(statements);
     } catch (e) {
       // 🌟 性能防御：D1 写入失败直接丢弃批次，严禁 unshift 导致队列内存堆积与时间轴错乱
@@ -1834,8 +1934,11 @@ const UI_HTML = `<!DOCTYPE html>
 
   <aside id="sidebar" class="w-64 h-full border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex flex-col z-30 absolute md:relative -translate-x-full md:translate-x-0 shadow-2xl md:shadow-none pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)]">
     <div class="h-16 flex items-center px-6 border-b border-slate-200 dark:border-slate-800">
-      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-indigo-600 flex items-center justify-center text-white font-bold text-lg">E</div>
-      <h1 class="ml-3 font-semibold tracking-tight text-lg">Emby Proxy</h1>
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-indigo-600 flex items-center justify-center text-white font-bold text-lg flex-shrink-0">E</div>
+      <h1 class="ml-3 font-semibold tracking-tight text-lg flex items-center gap-2">
+        Emby Proxy 
+        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.0</span>
+      </h1>
     </div>
     <nav class="flex-1 overflow-y-auto py-4 px-3 space-y-1">
       <a href="#dashboard" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50"><i data-lucide="layout-dashboard" class="w-5 h-5 mr-3"></i> 仪表盘</a>
@@ -1946,7 +2049,11 @@ const UI_HTML = `<!DOCTYPE html>
                 <p class="text-xs text-slate-500 mb-3 ml-6">高峰时段优先稳态传输，减少握手抖动、异常回源和多路复用放大的兼容性问题。</p>
                 <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-protocol-fallback" class="mr-2 w-4 h-4 rounded" checked> 开启协议回退与 403 重试 (剥离报错头重连，缓解视频报错)</label>
                 <p class="text-xs text-slate-500 mb-4 ml-6">当上游返回 403 或握手异常时，自动剥离可疑报错头并切换到更稳的协议后重试一次。</p>
-
+                <h3 class="font-bold mb-2 mt-6 text-slate-900 dark:text-white">起播加速优化 (Prewarm)</h3>
+                <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-enable-prewarm" class="mr-2 w-4 h-4 rounded" checked> 开启视频起播预热拦截</label>
+                <p class="text-xs text-slate-500 mb-3 ml-6">精准拦截播放器起播时的探测请求，利用 Cloudflare 边缘节点进行微型缓存，极大提升起播速度并保护源站。</p>
+                <label class="block text-sm text-slate-500 mb-1 ml-6">预热微缓存时长 (秒)</label>
+                <input type="number" id="cfg-prewarm-ttl" class="w-full md:w-1/2 p-2 ml-6 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="180">
                 <h3 class="font-bold mb-2 mt-6 text-slate-900 dark:text-white">跳转代理开关</h3>
                 <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-source-same-origin-proxy" class="mr-2 w-4 h-4 rounded" checked> 默认开启：源站和同源跳转代理</label>
                 <p class="text-xs text-slate-500 mb-3">开启时既包含源站 2xx 的 Worker 透明拉流，也包含同源 30x 的继续代理跳转；仅当节点被显式标记为直连时，源站 2xx 才会改为直连源站。关闭后，同源 30x 直接下发 Location。</p>
@@ -2424,6 +2531,8 @@ const UI_HTML = `<!DOCTYPE html>
           document.getElementById('cfg-peak-downgrade').checked = cfg.peakDowngrade !== false; 
           document.getElementById('cfg-protocol-fallback').checked = cfg.protocolFallback !== false; 
           document.getElementById('cfg-source-same-origin-proxy').checked = cfg.sourceSameOriginProxy !== false;
+          document.getElementById('cfg-enable-prewarm').checked = cfg.enablePrewarm !== false;
+          document.getElementById('cfg-prewarm-ttl').value = cfg.prewarmCacheTtl || 180;
           document.getElementById('cfg-force-external-proxy').checked = cfg.forceExternalProxy !== false;
           document.getElementById('cfg-wangpandirect').value = cfg.wangpandirect || '${DEFAULT_WANGPAN_DIRECT_TEXT}';
           document.getElementById('cfg-direct-node-search').value = '';
@@ -2458,6 +2567,8 @@ const UI_HTML = `<!DOCTYPE html>
               newConfig.enableH3 = document.getElementById('cfg-enable-h3').checked;
               newConfig.peakDowngrade = document.getElementById('cfg-peak-downgrade').checked;
               newConfig.protocolFallback = document.getElementById('cfg-protocol-fallback').checked;
+              newConfig.enablePrewarm = document.getElementById('cfg-enable-prewarm').checked;
+              newConfig.prewarmCacheTtl = parseInt(document.getElementById('cfg-prewarm-ttl').value) || 180;
               newConfig.sourceSameOriginProxy = document.getElementById('cfg-source-same-origin-proxy').checked;
               newConfig.forceExternalProxy = document.getElementById('cfg-force-external-proxy').checked;
               newConfig.wangpandirect = document.getElementById('cfg-wangpandirect').value.trim();
@@ -2574,19 +2685,38 @@ const UI_HTML = `<!DOCTYPE html>
           const title = document.getElementById(this.safeDomId('title', name));
           const txt = document.getElementById(this.safeDomId('lat', name));
           if (!dot || !title || !txt) return;
-          let color = '#ffffff';
-          if (ms <= 150) color = '#2ECC71';
-          else if (ms <= 200) color = '#F1C40F';
-          else if (ms <= 300) color = '#E67E22';
-          else color = '#E74C3C';
 
-          dot.style.backgroundColor = color;
-          dot.style.boxShadow = '0 0 8px ' + color;
+          // 清除旧的内联样式
+          dot.style.backgroundColor = '';
+          dot.style.boxShadow = '';
+
+          const baseDot = 'w-3 h-3 rounded-full mr-3 transition-colors duration-500 flex-shrink-0 ';
+          let colorClass = '';
+          let txtClass = '';
+
+          if (ms <= 150) {
+              colorClass = 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)] dark:shadow-[0_0_8px_rgba(52,211,153,0.4)]';
+              txtClass = 'text-emerald-600 dark:text-emerald-400 font-medium';
+          } else if (ms <= 200) {
+              colorClass = 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.6)] dark:shadow-[0_0_8px_rgba(251,191,36,0.4)]';
+              txtClass = 'text-amber-600 dark:text-amber-400 font-medium';
+          } else if (ms <= 300) {
+              colorClass = 'bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.6)] dark:shadow-[0_0_8px_rgba(251,146,60,0.4)]';
+              txtClass = 'text-orange-600 dark:text-orange-400 font-medium';
+          } else {
+              colorClass = 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)] dark:shadow-[0_0_8px_rgba(248,113,113,0.4)]';
+              txtClass = 'text-red-600 dark:text-red-400 font-medium';
+          }
+
+          dot.className = baseDot + colorClass;
+          txt.className = txtClass;
           txt.textContent = ms > 5000 ? 'Timeout' : (ms + ' ms');
+
           if (ms > 300) this.nodeHealth[name] = (this.nodeHealth[name] || 0) + 1;
           else this.nodeHealth[name] = 0;
-          if (this.nodeHealth[name] > 3) title.classList.add('text-red-500');
-          else title.classList.remove('text-red-500');
+          
+          if (this.nodeHealth[name] > 3) title.classList.add('text-red-600', 'dark:text-red-400');
+          else title.classList.remove('text-red-500', 'text-red-600', 'dark:text-red-400');
       },
 
       renderNodesGrid() {
@@ -2619,7 +2749,8 @@ const UI_HTML = `<!DOCTYPE html>
           headerRow.className = 'flex items-center mb-1 w-full';
           const dot = document.createElement('span');
           dot.id = dotId;
-          dot.className = 'w-3 h-3 rounded-full mr-3 bg-white transition-colors duration-500 flex-shrink-0';
+          // 使用 Tailwind 设置默认的中性灰/暗灰，并加上内阴影
+          dot.className = 'w-3 h-3 rounded-full mr-3 bg-slate-200 dark:bg-slate-700 transition-colors duration-500 flex-shrink-0 shadow-inner';
           const title = document.createElement('h3');
           title.id = titleId;
           title.className = 'font-semibold text-lg transition-colors flex-1 min-w-0 truncate';
@@ -2634,6 +2765,8 @@ const UI_HTML = `<!DOCTYPE html>
           const pingValue = document.createElement('span');
           pingValue.id = latId;
           pingValue.textContent = '--';
+          // 使用 Tailwind 统一设置文本样式
+          pingValue.className = 'text-slate-500 dark:text-slate-400 font-medium';
           pingLabel.appendChild(pingValue);
           const shield = document.createElement('span');
           shield.className = 'truncate ml-2 text-right';
@@ -2942,7 +3075,30 @@ const UI_HTML = `<!DOCTYPE html>
 
                   const statusCell = document.createElement('td');
                   statusCell.className = 'py-3 px-4 font-bold truncate ' + (l.status_code >= 400 ? 'text-red-500' : 'text-emerald-500');
-                  statusCell.textContent = String(l.status_code);
+                  
+                  // [UI优化] 4xx/5xx 悬停查看错误详情与头信息
+                  if (l.status_code >= 400) {
+                      const errMap = {
+                          400: 'Bad Request (请求无效或参数错误)',
+                          401: 'Unauthorized (未授权，客户端登录失败或缺少凭证)',
+                          403: 'Forbidden (拒绝访问：命中防火墙、IP黑名单或源站拒绝)',
+                          404: 'Not Found (目标不存在：节点未找到或上游路径错误)',
+                          405: 'Method Not Allowed (不允许的请求方法)',
+                          429: 'Too Many Requests (限流拦截：单 IP 请求过频)',
+                          500: 'Internal Server Error (源站或代理内部执行报错)',
+                          502: 'Bad Gateway (网关错误：源站宕机、地址无效或无法连通)',
+                          503: 'Service Unavailable (服务不可用：源站超载或维护)',
+                          504: 'Gateway Timeout (网关超时：目标源站无响应)',
+                          522: 'Connection Timed Out (CF 无法与您的源站建立 TCP 连接)'
+                      };
+                      let hint = errMap[l.status_code] || ('HTTP 异常码: ' + l.status_code);
+                      if (l.error_detail) hint += '&#10;[抓取详情] ' + l.error_detail; 
+                      
+                      // 使用单引号拼接，防止破坏 UI_HTML 外层反引号
+                      statusCell.innerHTML = '<span class="cursor-help border-b border-dashed border-red-400/70 pb-[1px]" title="' + hint.replace(/"/g, '&quot;') + '">' + l.status_code + '</span>';
+                  } else {
+                      statusCell.textContent = String(l.status_code);
+                  }
 
                   const ipCell = document.createElement('td');
                   ipCell.className = 'py-3 px-4 font-mono text-xs truncate';
@@ -3154,7 +3310,7 @@ export default {
         if (db) {
           try {
             const retentionDays = config.logRetentionDays || 7; 
-            const expireTime = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
+            const expireTime = Date.当前() - (retentionDays * 24 * 60 * 60 * 1000);
             await db.prepare("DELETE FROM proxy_logs WHERE timestamp < ?").bind(expireTime).run();
           } catch (dbErr) {
             console.error("Scheduled DB Cleanup Error: ", dbErr);
